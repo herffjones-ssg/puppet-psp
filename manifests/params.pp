@@ -13,12 +13,6 @@
 class psp::params {
   $gid          = '490'
   $uid          = '490'
-  # Customize these values if you (for example) mirror public YUM repos to your
-  # internal network.
-  $yum_server   = 'http://downloads.linux.hp.com'
-  $yum_path     = '/SDR/downloads/proliantsupportpack'
-  $yum_priority = '50'
-  $yum_protect  = '0'
 
 # The following parameters should not need to be changed.
 

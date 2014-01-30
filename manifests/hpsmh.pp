@@ -275,6 +275,18 @@ class psp::hpsmh (
 #        notify  => Service['hpsmhd'],
 #      }
 
+      firewall { '200 Allow acces to HPSMH TCP 2301':
+        action => accept,
+        dport  => '2301',
+        proto  => 'tcp',
+      }
+
+      firewall { '200 Allow acces to HPSMH TCP 2381':
+        action => accept,
+        dport  => '2381',
+        proto  => 'tcp',
+      }
+
       service { 'hpsmhd':
         ensure     => $service_ensure_real,
         enable     => $service_enable_real,

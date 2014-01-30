@@ -69,15 +69,6 @@ class psp (
         shell  => '/sbin/nologin',
       }
 
-      yumrepo { 'HP-psp':
-        descr    => 'HP Software Delivery Repository for Proliant Support Pack',
-        enabled  => 1,
-        gpgcheck => 1,
-        gpgkey   => "${psp::params::yum_server}${psp::params::yum_path}/GPG-KEY-ProLiantSupportPack",
-        baseurl  => "${psp::params::yum_server}${psp::params::yum_path}/${psp::params::yum_os}/\$releasever/packages/\$basearch/",
-        priority => $psp::params::yum_priority,
-        protect  => $psp::params::yum_protect,
-      }
     }
     # If we are not on HP hardware, do not do anything.
     default: { }

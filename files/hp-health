@@ -1,0 +1,825 @@
+#!/bin/sh
+#
+# (c) Copyright 2002, 2008 Hewlett-Packard Development Company, L.P.
+#
+# See "man chkconfig" for information on next two lines (Red Hat only)
+# chkconfig: 2345 91 2
+# description: hp System Health Monitor and Command line Utility Package. 
+#
+#
+# Following lines are in conformance with LSB 1.2 spec
+### BEGIN INIT INFO
+# Provides:            hp-health
+# Required-Start: 
+# Required-Stop: 
+# Should-Start:        hp-ilo
+# Default-Start:       2 3 4 5
+# Default-Stop:        0 1 6
+# Description:         starts hpasm (HP System Health Monitor)
+### END INIT INFO
+
+#list of known agent that could use this interface
+AGENTS="cmahealthd cmastdeqd cmahostd cmathreshd cmasm2d cmarackd cmapeerd cmaeventd cmafcad cmasasd cmaidad cmaided cmascsid cmanicd"
+HPOPENIPMI_ROOT="/opt/hp/hp-OpenIPMI"
+KVER="$(uname -r)"
+
+PCI_VENDOR_ID_COMPAQ="0e11"
+PCI_VENDOR_ID_HP="103c"
+PCI_DEVICE_ID_ILO="b203" # iLO and iLO2
+PCI_DEVICE_ID_ILO3="3307"
+
+PCIID_ILO="$PCI_VENDOR_ID_COMPAQ:$PCI_DEVICE_ID_ILO"
+PCIID_ILO3="$PCI_VENDOR_ID_HP:$PCI_DEVICE_ID_ILO3"
+
+# return codes for probe_ilo()
+ILO_NO_ILO=0
+ILO_NO_EMBEDDED_HEALTH=1
+ILO_WITH_EMBEDDED_HEALTH=2
+ILO_WITH_EMBEDDED_HEALTH_G3=3
+
+PARAM=$1
+val=0
+# source function library
+if [ -f /etc/rc.d/init.d/functions ]; then
+    . /etc/rc.d/init.d/functions
+elif [ -f /etc/rc.status ]; then
+    . /etc/rc.status
+fi
+
+PATH=/sbin:/usr/sbin:/bin:/usr/bin:/opt/hp/hp-health/bin
+
+if [ -z "$LOGFILE" ]; then
+    LOGFILE=/var/log/hp-health/hpasmd.log
+    if [ ! -d /var/log/hp-health ]; then
+	mkdir -p /var/log/hp-health
+    fi
+fi
+
+cmaerr () {
+    printf "  $*\n" >&2
+    printf "  $*\n" >>$LOGFILE 2>&1
+}
+
+cmaecho () {
+    printf "  $*\n"
+    printf "  $*\n" >>$LOGFILE 2>&1
+}
+
+cmaechon () {
+    printf "  $*"
+    printf "  $*" >>$LOGFILE 2>&1
+}
+
+showsuccess() {
+    if [ -f /etc/rc.d/init.d/functions ]; then
+	echo_success
+    elif [ -f /etc/rc.status ]; then
+	rc_reset
+	rc_status -v
+    else
+	printf "\t\t[ SUCCESS ]\n"
+    fi
+}
+
+showfailure() {
+    if [ -f /etc/rc.d/init.d/functions ]; then
+	echo_failure
+    elif [ -f /etc/rc.status ]; then
+	rc_failed
+	rc_status -v
+    else
+	printf "\t\t[ FAILED ]\n"
+    fi
+}
+
+stopproc () 
+{
+    pidlist=`pidof -o $$ $1`
+    if [ -z "$pidlist" ]; then
+	return 0
+    fi
+    
+    kill "$pidlist"
+
+    while [ -n "$pidlist" ]; do
+	sleep 1 
+	pidlist=`pidof -o $$ $1`
+    done
+
+   return 0
+}
+
+is_24_kernel() {
+    [ "$(uname -r | cut -d. -f1-2)" = "2.4" ]
+}
+
+is_26_kernel() {
+    [ "$(uname -r | cut -d. -f1-2)" = "2.6" ]
+}
+
+is_empty_dir() {
+    local dir="$1"
+
+    if [ -z "$(find "$dir" -maxdepth 0 -type d -empty)" ]; then
+	return 1
+    fi
+
+    return 0
+}
+
+## Checking to see if OS is ESX 4.0 (from VMware)
+## return code is 0 = yes, ESX 4.0
+## return code is 1 = no, not ESX 4.0 
+##
+## An assumption here is that only ESX systems would have /usr/bin/vmware
+## and ESX 4x is based on the 2.6 kernel
+is_OS_VMware4x() {
+    RET_STAT=1
+    test -x /usr/bin/vmware && is_26_kernel
+    if [ $? -eq 0 ]; then
+        vmware -v | grep ESX > /dev/null
+        if [ $? -eq 0 ]; then
+            uname -a | grep ESX > /dev/null
+            if [ $? -eq 0 ]; then
+                RET_STAT=0
+            fi
+        fi
+    fi
+    return $RET_STAT
+}
+
+module_name() {
+    if is_24_kernel; then
+        echo ipmi_si_drv.o
+    else
+        echo ipmi_si.ko
+    fi
+}
+
+module_is_loaded() {
+    if lsmod | grep -q "$1"; then
+	return 0
+    fi
+    return 1
+}
+
+ipmi_loaded() {
+    if module_is_loaded ipmi_devintf; then
+	return 0
+    fi
+    return 1
+}
+
+_have_hp_ipmi() {
+    test -f "$HPOPENIPMI_ROOT/hp-OpenIPMI"
+}
+
+USELESS_HP_OPENIPMI_WARNED="no" # we only want to warn once
+warn_useless_hpopenipmi() {
+    local reason="$1"
+    if [ "$USELESS_HP_OPENIPMI_WARNED" = "no" ]; then
+	cmaerr "****"
+	cmaerr "Warning: $reason"
+	cmaerr "hp-OpenIPMI will not be used. It is safe to uninstall hp-OpenIPMI."
+	cmaerr "On RPM-based systems, you can remove hp-OpenIPMI by running:"
+	cmaerr "  'rpm -e hp-OpenIPMI'"
+	cmaerr "****"
+	USELESS_HP_OPENIPMI_WARNED="yes"
+    fi
+}
+
+have_hp_ipmi() {
+    if ! _have_hp_ipmi; then
+	return 1
+    fi
+    if ! have_ilo || have_embedded_health_g3; then
+	warn_useless_hpopenipmi "hp-OpenIPMI is not supported on this platform."
+	return 1
+    fi
+    if distro_ipmi_is_hpasmxld_compatible; then
+	warn_useless_hpopenipmi "hp-OpenIPMI is no longer necessary on this OS release."
+	return 1
+    fi
+    return 0
+}
+
+module_path() {
+    local module=$(module_name)
+
+    if have_hp_ipmi; then
+	echo "$HPOPENIPMI_ROOT/bin/${KVER}/$module"
+    else
+	echo "/lib/modules/${KVER}/kernel/drivers/char/ipmi/$module"
+    fi
+}
+
+hp_ipmi_needs_rebuild() {
+    local module=$(module_name)
+
+    if [ -f "${HPOPENIPMI_ROOT}/bin/${KVER}/$module" ]; then
+	return 1
+    else
+	return 0
+    fi
+}
+
+attempt_hp_ipmi_build() {
+    cd $HPOPENIPMI_ROOT
+    cmaecho "hpasmxld:  Attempting Rebuild of hp-OpenIPMI package" 
+    sh check_install_kernel.sh >> $LOGFILE
+
+    if [ $? -ne 0 ]; then
+	cmaecho "Can not rebuild the hp-OpenIPMI drivers!"
+	cmaecho "See $LOGFILE for details."
+	cmaecho "See hp-OpenIPMI(4) and hpasm(4) for options."
+	cd - > /dev/null
+	exit 99
+    else
+	cmaecho "hpasmxld:  Successful rebuild of hp-OpenIPMI package" 
+    fi
+    cd - > /dev/null
+}
+
+# This function assumes that any IPMI modules have already been loaded.
+# "$STARTADDON" currently loads IPMI modules, so call it first.
+guess_dev_file() {
+    if have_chif_ipmi; then
+	echo "/dev/hpilo"
+	return
+    fi
+
+    if [ ! -d /proc/ipmi ]; then
+	# This could be because /proc isn't mounted, or because we are
+	# on ESX (which doesn't expose /proc/ipmi/). In either case,
+	# we can't autodetect the best interface, so jr
+	# is available, 
+	echo "/dev/ipmi0"
+	return
+    fi
+
+    if is_empty_dir /proc/ipmi; then
+	cmaerr "Warning: No IPMI interfaces found in /proc"
+	# Maybe the /proc interface has changed?
+	echo "/dev/ipmi0"
+	return
+    fi
+	
+    for i in /proc/ipmi/*; do
+	if grep -qE '^interrupts_enabled: *1$' ${i}/si_stats; then
+	    echo "/dev/ipmi${i#/proc/ipmi/*}"
+	    return
+	fi
+    done
+
+    echo "/dev/ipmi0"
+    return
+}
+
+have_distro_ipmi() {
+    return 0
+}
+
+## Check to see if the distro's IPMI drivers are new enough to
+## provide feature parity with hp-OpenIPMI
+## NOTE: this function also exists in hp-OpenIPMI's
+## check_install_kernel script. Be sure to update both.
+distro_ipmi_is_hpasmxld_compatible() {
+    local kpatch="$(echo $KVER | cut -d. -f2)"
+    local ksub="$(echo $KVER | sed -r 's/[0-9]+\.[0-9]+\.([0-9]+).*/\1/')"
+
+    # Upstream 2.6.30 is sufficient
+    if [ "$kpatch" = 6 ] && [ -n "$ksub" ] && [ "$ksub" -ge 30 ]; then
+	return 0
+    fi
+
+    # RHEL5.5 includes the necessary backport
+    if echo "$KVER" | grep -E -q '^2\.6\.18-([0-9]+)(\.[0-9]+)*\.el5$'; then
+	local rhel5rev="$(echo $KVER | sed -r 's/2\.6\.18-([0-9]+)(\.[0-9]+)*\.el5/\1/')"
+	if [ -n "$rhel5rev" ] && [ "$rhel5rev" -gt 176 ]; then
+	    return 0
+	fi
+    fi
+
+    return 1
+}
+
+config_distro_ipmi() {
+    local modopts="$1"
+    local modprobe_delay="$2"
+
+    delay=""
+    if [ "$modprobe_delay" -gt 0 ]; then
+	delay="sleep $modprobe_delay\n\t\t"
+    fi
+
+    if [ -f /etc/init.d/ipmi ]; then
+	sed "s/modprobe \${IPMI_SI_MODULE_NAME}/${delay}modprobe \${IPMI_SI_MODULE_NAME} $modopts/" /etc/init.d/ipmi > /etc/init.d/ipmi.hp
+	chmod 755 /etc/init.d/ipmi.hp
+	STARTADDON="/etc/init.d/ipmi.hp start"
+	STATUSADDON="/etc/init.d/ipmi.hp status"
+    else
+	if [ -d /etc/modprobe.d -a -n "$modopts" ]; then
+            cat > /etc/modprobe.d/hp-health <<EOF
+# FILE GENERATED BY /etc/init.d/hp-health
+# DO NOT EDIT - CHANGES WILL GET OVERWRITTEN
+options $(module_name | cut -d. -f1) $modopts
+EOF
+	fi
+        STARTADDON="modprobe -a ipmi_si ipmi_devintf"
+        STATUSADDON=":"
+    fi
+    cmaecho "Using standard Linux IPMI device driver"
+}
+
+supports_pci_vend_devs() {
+    modinfo -p $(module_path) | grep -q pci_vend_devs
+}
+
+supports_pci_probe() {
+    nm $(module_path) | grep -q ipmi_pci_probe
+}
+
+## Scan the system for an iLO device. Return one of the following:
+## $ILO_NO_ILO - no iLO device found
+## $ILO_NO_EMBEDDED_HEALTH - iLO found, does not support embedded health
+## $ILO_WITH_EMBEDDED_HEALTH - iLO supporting embedded health found
+## $ILO_WITH_EMBEDDED_HEALTH_G3 - iLO3 supporting embedded health found
+probe_ilo() {
+    local dev=""
+
+    for id in $PCIID_ILO $PCIID_ILO3; do
+    dev="$(lspci -d $id | cut -d' ' -f1)"
+    if [ -n "$dev" ]; then
+        if [ "$id" = "$PCIID_ILO" ]; then
+            if ! lspci -xv -s "$dev" | grep -q "3c 10 05 33"; then
+		return "$ILO_NO_EMBEDDED_HEALTH"
+            fi
+            return "$ILO_WITH_EMBEDDED_HEALTH"
+        fi
+        return "$ILO_WITH_EMBEDDED_HEALTH_G3"
+    fi
+    done
+
+    return "$ILO_NO_ILO"
+}
+
+have_ilo() {
+    probe_ilo
+    if [ $? = "$ILO_NO_ILO" ]; then
+	return 1
+    fi
+    return 0
+}
+
+no_embedded_health() {
+    probe_ilo
+    if [ $? -eq "$ILO_NO_EMBEDDED_HEALTH" ]; then
+        return 0
+    fi
+    return 1
+}
+
+have_embedded_health() {
+    probe_ilo
+    if [ $? -eq "$ILO_WITH_EMBEDDED_HEALTH" ]; then
+        return 0
+    fi
+    return 1
+}
+
+have_embedded_health_g3() {
+    probe_ilo
+    if [ $? -eq "$ILO_WITH_EMBEDDED_HEALTH_G3" ]; then
+        return 0
+    fi
+    return 1
+}
+
+hpilo_found_device() {
+  if [ ! -d /sys/class/iLO ]; then
+      return 1
+  fi
+
+  if [ "$(ls -1A /sys/class/iLO | wc -l)" -eq 0 ]; then
+      return 1
+  fi
+
+  return 0
+}
+
+hpilo_claim_ilo3() {
+    local newid_file="/sys/bus/pci/drivers/hpilo/new_id"
+    modprobe hpilo > /dev/null 2>&1
+    if ! hpilo_found_device && test -f "$newid_file"; then
+    # Older hpilo (pre-2.6.29) drivers are compatible w/ iLO3 but
+    # don't recognize the PCI ID
+	echo "$PCI_VENDOR_ID_HP $PCI_DEVICE_ID_ILO3" > "$newid_file"
+    fi
+}
+
+have_chif_ipmi() {
+    if is_OS_VMware4x; then
+       RUNNING=`/usr/sbin/vmkload_mod -l | fgrep hpilo | cut -d" " -f1`
+       if  have_embedded_health_g3 && [  "$RUNNING"="hpilo" ] && [ -c /vmfs/devices/char/vmkdriver/hpilo-d0ccb0 ]; then
+          return 0
+       fi
+    fi
+    if ! have_embedded_health_g3; then
+	return 1
+    fi
+
+    # fast path success
+    if hpilo_found_device; then
+	return 0
+    fi
+
+    hpilo_claim_ilo3
+    hpilo_found_device
+    return $?
+}
+
+have_100_series_productname() {
+    if [ -z "$(which dmidecode)" ]; then
+        cmaerr "Error: Could not find dmidecode utility, unable to identify system"
+        return 1
+    fi
+    cmaechon "Trying to identify the Product Name..."
+    PRODNAME=`dmidecode | grep "Product Name" | cut -d" " -f4 | head -n1`
+    GENERATION=`dmidecode | grep "Product Name" | cut -d" " -f5 | head -n1`
+    PRODNUM=`echo $PRODNAME |  egrep -o '[0-9][0-9][0-9]'`
+    if [ "$PRODNUM" -ge 100 -a "$PRODNUM" -lt 200 ] ; then  # TRUE only if the server is 100 series
+        if [ "$GENERATION" = "G6" -o "$GENERATION" \> "G6" ]; then  # TRUE only if the server is G6 or higher
+            cmaecho "Done"
+            return 0
+        fi
+    fi
+    cmaecho ""
+    return 1
+}
+
+## Used to cache the answer the first time through
+SUPPORTED_100_SERIES=""
+is_supported_100_series() {
+    if [ -z "$SUPPORTED_100_SERIES" ]; then
+	SUPPORTED_100_SERIES=1
+        # Check if it is an iLO/iLO2 system
+	if have_ilo; then
+            return $SUPPORTED_100_SERIES
+	fi
+        # We need /proc/acpi/dsdt to identify 100series 
+	if [ ! -f /proc/acpi/dsdt ]; then
+            if [ ! is_OS_VMware4x ]; then 
+                cmaerr "ERROR: /proc/acpi/dsdt does not exist"
+                cmaerr "Cannot use ACPI tables to identify system"
+            fi
+            # Check the Product Name if we cannot parse 
+            # ACPI DSDT table to identify the system
+            if ! have_100_series_productname; then
+                cmaerr "ERROR: This server is NOT supported!"
+                return $SUPPORTED_100_SERIES
+            else
+                SUPPORTED_100_SERIES=0
+                return $SUPPORTED_100_SERIES
+            fi
+	fi
+        # Search the ACPI IPMI device _HID in 
+        # /proc/acpi/dsdt ouptut.
+        # For G6 servers, the HID wil be
+        #   Name (_HID, EisaId ("HPQ000B"))
+        # In AML(ACPI Machine Language), it can be coded as
+        #   08 5f 48 49 44 0c 22 11 00 0b
+        # 5f 48 49 44  -  _HID
+        # 22 11 00 0b  -  EISAID ("HPQ000B")
+        # 08           -  Name Op
+        # Refer ACPI Spec for AML specification.
+        # We search the above pattern in ACPI DSDT table. If we
+        # find a match, then we conclude that it is a supported
+        # 100series server.
+	local ACPI_DEV="\x08\x5f\x48\x49\x44\x0c\x22\x11\x00\x0b"
+	if [ "$(awk '/'$ACPI_DEV'/ {print 1}' /proc/acpi/dsdt)" ]; then
+            SUPPORTED_100_SERIES=0
+	else
+            cmaerr "ERROR: This Server is NOT Supported!"
+	fi
+    fi
+    return $SUPPORTED_100_SERIES
+}
+
+config_hp_ipmi() {
+    if hp_ipmi_needs_rebuild; then
+	attempt_hp_ipmi_build
+    fi
+    
+    if ! ipmi_loaded; then
+        STARTADDON="$HPOPENIPMI_ROOT/hp-OpenIPMI start"
+    fi
+
+    STATUSADDON="$HPOPENIPMI_ROOT/hp-OpenIPMI status"
+}
+
+use_hpasmd() {
+    NAME="Proliant System Health Monitor"
+    PNAME="hpasmd"
+}    
+
+use_hpasmxld() {
+    NAME="Proliant High Performance\n \tIPMI based System Health Monitor"
+    PNAME="hpasmxld"
+    cmaecho "Using $NAME"
+}
+
+use_hpasmlited() {
+    NAME="Proliant Standard\n \tIPMI based System Health Monitor"
+    PNAME="hpasmlited"
+    cmaecho "Using $NAME"
+}
+
+use_hpasmpld() {
+    NAME="Proliant Standard\n \tIPMI based 1XX System Health Monitor"
+    PNAME="hpasmpld"
+    cmaecho "Using $NAME"
+}
+
+SetupIPMI() {
+
+    ## NOTE: This test must be first in this function 
+    ## - see comments in guess_dev_file()
+    ##   same circumtances apply for this function
+    if is_OS_VMware4x; then 
+        ## IPMI is already in vmkernel, no setup needed
+	return 0
+    fi
+
+    if no_embedded_health && ! is_supported_100_series; then
+        ## We don't need IPMI
+	return 0
+    fi
+
+    if have_chif_ipmi; then
+        ## We don't need OpenIPMI
+	return 0
+    fi
+
+    if have_hp_ipmi; then
+	config_hp_ipmi
+	return
+    fi
+
+    if ! have_distro_ipmi; then
+	echo
+	cmaecho "ERROR: There is NO IPMI support available on this system!"
+	cmaecho "Please install the hp-OpenIPMI package or enable IPMI support"
+	cmaecho "for this distribution. Aborting hp-health initialization process!"
+	exit 1
+    fi
+
+    ## Use distro's IPMI stack ##
+
+    if supports_pci_vend_devs; then
+	modopts="${modoptprefix}type=kcs"
+	modopts="$modopts ${modoptprefix}pci_vend_devs=0x103c3302"
+	modopts="$modopts ${modoptprefix}debug_intfs=0"
+    fi
+
+    if is_24_kernel || ! supports_pci_probe; then
+	modopts="${modoptprefix}type=kcs"
+	modopts="$modopts ${modoptprefix}ports=0xca2"
+    fi
+    
+    if is_24_kernel; then
+	modprobe_delay=3
+    else
+	modprobe_delay=0
+    fi
+
+    config_distro_ipmi "$modopts" "$modprobe_delay"
+}
+
+DetermineProg() {
+    if is_supported_100_series; then
+	use_hpasmpld
+	return
+    fi
+
+    if ! have_ilo; then
+	cmaerr "Error: No supported management controller found"
+	exit 1
+    fi
+
+    # We have iLO
+    if no_embedded_health; then
+	use_hpasmd
+	return
+    fi
+
+    ## NOTE: This test must be first in this function 
+    ## - see comments in guess_dev_file()
+    ##   same circumtances apply for this function
+    if is_OS_VMware4x; then
+	use_hpasmlited
+	return
+    fi
+
+    if have_embedded_health_g3; then
+        use_hpasmlited
+        return
+    fi
+
+    if have_hp_ipmi || distro_ipmi_is_hpasmxld_compatible; then
+	use_hpasmxld
+	return
+    fi
+
+    use_hpasmlited
+}
+
+agents_running() {
+    pidof -o $$ $AGENTS > /dev/null
+}
+
+start_agents() {
+    if [ -x /etc/init.d/hp-snmp-agents ]; then
+	/etc/init.d/hp-snmp-agents start
+    fi
+}
+
+stop_agents() {
+    if [ -x /etc/init.d/hp-snmp-agents ]; then
+	/etc/init.d/hp-snmp-agents stop
+    fi
+}
+
+check_pid_max() {
+	local pidmax="$(sysctl -n kernel.pid_max || cat /proc/sys/kernel/pid_max)"
+	if [ $pidmax -gt 4194304 ]; then
+		showfailure
+		cmaecho
+		cmaecho "INFO: Reset the pid_max to value <= 4194304"
+		exit 1
+	fi
+}
+
+start_proc() {
+    check_pid_max
+    $STARTADDON
+    RETVAL=$?
+    if [ $RETVAL -eq 0 ]; then
+        if [ "$PNAME" = "hpasmxld" ]; then
+            cmaecho "Starting Proliant High Performance"
+            cmaechon "IPMI based System Health Monitor ($PNAME): "
+        else
+            cmaecho "Starting $NAME ($PNAME): "
+        fi
+	
+        pidlist=`pidof -o $$ $PNAME`
+	
+        if [ -z "$pidlist" ]; then
+	    PARGS=""
+	    if [ "$PNAME" != "hpasmd" ]; then
+		PARGS="-f $(guess_dev_file)"
+	    fi
+	    $PNAME $PARGS < /dev/null >> $LOGFILE 2>&1
+            RETVAL=$?
+            if [ $RETVAL -eq 0 ]; then
+		if [ -d /var/lock/subsys ]; then
+		    touch /var/lock/subsys/hp-health
+		fi
+            fi
+        else
+            RETVAL=1
+        fi
+    fi
+}
+
+stop_proc()
+{
+
+    pidlist=`pidof -o $$ $PNAME`
+
+    if [ -z "$pidlist" ]; then
+    # Don't consider it an error if the process is already stopped.
+    # This avoids deb upgrade failures when no daemon is running.
+        RETVAL=0
+	cmaechon "Already stopped $NAME ($PNAME): "
+    else
+	if [ "$PNAME" = "hpasmxld" ]; then
+		cmaecho "Shutting down Proliant High Performance"
+		cmaechon "IPMI based System Health Monitor ($PNAME): "
+	else
+		cmaechon "Shutting down $NAME ($PNAME): "
+	fi
+
+        stopproc $PNAME
+        RETVAL=$?
+        if [ $RETVAL -eq 0 ]; then
+            rm -rf /var/lock/subsys/hp-health
+        fi
+        if [ $RETVAL -eq 1 ]; then
+            showfailure
+            cmaecho
+            cmaecho "($PNAME) may be in use. Please stop all agents before stopping hp-health"
+            exit 1
+        fi
+    fi
+}
+
+DetermineProg
+SetupIPMI
+
+#both hpasmxld and hpasmlited depend on the output 
+#of IrqRouteTbl so run it now
+if [ "$PNAME" != "hpasmd" -a "$1" = "start" ]; then 
+    if [ -x /opt/hp/hp-health/bin/IrqRouteTbl ]; then
+	/opt/hp/hp-health/bin/IrqRouteTbl
+    fi
+fi
+
+RETVAL=0
+agents_need_restart="false"
+case "$1" in
+  start)
+	if agents_running; then
+	    stop_agents
+	    agents_need_restart="true"
+	fi
+        start_proc
+	if [ "$agents_need_restart" = "true" ]; then
+	    start_agents
+            agents_need_restart="false"
+            val=1
+	fi
+    ;;
+  stop)
+	if agents_running; then
+	    stop_agents
+	fi
+	stop_proc
+    ;;
+  restart)
+	if agents_running; then
+	    stop_agents
+	    agents_need_restart="true"
+	fi
+	stop_proc
+	RETVAL=$?
+	if [ $RETVAL -eq 0 ]; then
+	    showsuccess
+	    cmaecho
+            start_proc
+	    RETVAL=$?
+	else
+            showfailure
+            pidlist=`pidof -o $$ $PNAME`
+            if [ -z "$pidlist" ]; then
+                start_proc
+                RETVAL=$?
+            fi
+	fi
+        if [ $RETVAL -eq 0 ]; then
+            showsuccess
+        else
+            showfailure
+        fi
+	;;
+    status)
+        if [ -n "$STATUSADDON" ]; then
+	    cmaecho
+        fi
+	$STATUSADDON
+	cmaecho
+        if [ -f /etc/rc.status ]; then
+            cmaechon "$PNAME is ..."
+            checkproc $PNAME
+            rc_status -v
+            exit 0
+        else
+            pid=`pidof -o $$ -o $PPID -o %PPID -x $PNAME`
+            if [ -n "$pid" ]; then
+                cmaechon "($PNAME) is running..."
+            else
+                cmaechon "($PNAME) is stopped..."
+            fi
+	    RETVAL=$?
+        fi
+	;;
+    *)
+	cmaecho "Usage: /etc/init.d/hp-health {start|stop|restart|status}"
+	exit 1
+        ;;
+esac
+
+if [ "$agents_need_restart" = "true" ]; then
+    start_agents
+fi
+
+if [ "$1" != "restart" -a $val != 1 ]; then
+    if [ $RETVAL -eq 0 ]; then
+	showsuccess
+    else
+	showfailure
+    fi
+fi
+
+cmaecho
+
+exit $RETVAL

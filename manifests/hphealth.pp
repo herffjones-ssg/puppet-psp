@@ -85,12 +85,31 @@ class psp::hphealth (
         name   => $psp::params::ipmi_name,
       }
 
+      package { 'glibc.i686':
+        ensure => $package_ensure,
+      }
+
       package { 'hponcfg':
         ensure => $package_ensure,
       }
 
       package { 'hp-health':
-        ensure => $package_ensure,
+        ensure    => $package_ensure,
+      }
+
+      # TODO - This was added by Herff Jones because of a bug with RHEL6
+      # IPMI_si module. Once this is fixed, please remove this section. This is
+      # the only addition to this stock module from the forge. See
+      # https://access.redhat.com/knowledge/solutions/329973
+      file { 'hp-health-init':
+        ensure  => file,
+        path    => '/etc/init.d/hp-health',
+        source  => 'puppet:///modules/psp/hp-health',
+        owner   => 'root',
+        group   => 'root',
+        mode    => '0755',
+        require => Package['hp-health'],
+        notify  => Service['hp-health'],
       }
 
       package { 'hpacucli':
